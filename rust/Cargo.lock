@@ -729,6 +729,7 @@ dependencies = [
 name = "godot_wry"
 version = "0.1.0"
 dependencies = [
+ "gdkx11",
  "godot",
  "gtk",
  "http",

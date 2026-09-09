@@ -52,6 +52,8 @@ struct WebView {
     previous_viewport_size: Vector2i,
     previous_window_position: Vector2i,
     previous_content_scale_factor: f32,
+    #[cfg(target_os = "linux")]
+    x11_pointer_inside: bool,
     #[export]
     full_window_size: bool,
     #[export]
@@ -95,6 +97,8 @@ impl IControl for WebView {
             previous_viewport_size: Vector2i::default(),
             previous_window_position: Vector2i::default(),
             previous_content_scale_factor: 1.0,
+            #[cfg(target_os = "linux")]
+            x11_pointer_inside: false,
             full_window_size: true,
             url: "https://github.com/doceazedo/godot_wry".into(),
             html: "".into(),
@@ -212,6 +216,9 @@ impl WebView {
         while gtk::events_pending() {
             gtk::main_iteration_do(false);
         }
+
+        #[cfg(target_os = "linux")]
+        self.update_x11_keyboard_focus();
     }
 
     fn build_webview(&mut self) {
@@ -568,8 +575,15 @@ impl WebView {
         let webview_builder = if self.forward_input_events {
             webview_builder.with_initialization_script(
                 r#"
+                // Linux/WebKitGTK: while the webview is embedded as an X11 child window of the
+                // Godot window, the page never reports document.hasFocus() (the internal GTK
+                // toplevel is not a WM-managed window, so WebKit never receives focus events).
+                // The old `if (!document.hasFocus()) return;` guard therefore silently dropped
+                // every event that was meant to be forwarded to Godot on Linux. The guard has
+                // been removed: DOM events can only fire while the window actually has the
+                // pointer/events, which is the only filtering we need.
                 document.addEventListener('mousemove', (e) => {
-                    if (!document.hasFocus()) return;
+
                     window.ipc.postMessage(JSON.stringify({
                         type: '_mouse_move',
                         x: e.clientX,
@@ -580,7 +594,7 @@ impl WebView {
                     }));
                 });
                 document.addEventListener('mousedown', (e) => {
-                    if (!document.hasFocus()) return;
+
                     window.ipc.postMessage(JSON.stringify({
                         type: '_mouse_down',
                         x: e.clientX,
@@ -589,7 +603,7 @@ impl WebView {
                     }));
                 });
                 document.addEventListener('mouseup', (e) => {
-                    if (!document.hasFocus()) return;
+
                     window.ipc.postMessage(JSON.stringify({
                         type: '_mouse_up',
                         x: e.clientX,
@@ -598,7 +612,7 @@ impl WebView {
                     }));
                 });
                 document.addEventListener('wheel', (e) => {
-                    if (!document.hasFocus()) return;
+
                     window.ipc.postMessage(JSON.stringify({
                         type: '_mouse_wheel',
                         x: e.clientX,
@@ -612,7 +626,7 @@ impl WebView {
                     }));
                 });
                 document.addEventListener('keydown', (e) => {
-                    if (!document.hasFocus()) return;
+
                     const isModifier = ["Alt", "Shift", "Control", "Meta"].includes(e.key);
                     window.ipc.postMessage(JSON.stringify({
                         type: '_key_down',
@@ -626,7 +640,7 @@ impl WebView {
                     }));
                 });
                 document.addEventListener('keyup', (e) => {
-                    if (!document.hasFocus()) return;
+
                     const isModifier = ["Alt", "Shift", "Control", "Meta"].includes(e.key);
                     window.ipc.postMessage(JSON.stringify({
                         type: '_key_up',
@@ -681,6 +695,52 @@ impl WebView {
             "visibility_changed",
             &Callable::from_object_method(&*self.base(), "update_visibility"),
         );
+    }
+
+    /// Linux-only: the webview is a native X11 child window stacked over the Godot window,
+    /// and X11 only delivers key events to the focused window. WebKitGTK never receives the
+    /// X input focus by itself in this embed, so DOM `keydown`/`keyup` never fire and can't
+    /// be forwarded to Godot. While the mouse pointer is inside the webview bounds we hand
+    /// the X input focus to the webview; once the pointer leaves we give it back to Godot.
+    #[cfg(target_os = "linux")]
+    fn update_x11_keyboard_focus(&mut self) {
+        if self.webview.is_none() || !self.forward_input_events {
+            return;
+        }
+
+        let Some(godot_xid) = godot_window_x11_id(self.window_id) else {
+            return;
+        };
+        let Some(webview_xid) = self.webview.as_ref().and_then(webview_x11_id) else {
+            return;
+        };
+
+        // A hidden node must never receive focus; treat it as "pointer outside" so that a
+        // stale focus on the webview gets released on the next frame.
+        let visible = self.base().is_visible_in_tree();
+        let inside = visible
+            && self
+                .base()
+                .get_global_rect()
+                .contains_point(self.base().get_global_mouse_position());
+
+        if inside == self.x11_pointer_inside {
+            return;
+        }
+
+        match x11_input_focus_window() {
+            // Only steal focus when we already own it (Godot window or this webview),
+            // so we never yank it away from another application.
+            Some(current) if inside && (current == godot_xid || current == webview_xid) => {
+                x11_set_input_focus(webview_xid);
+            }
+            Some(current) if !inside && current == webview_xid => {
+                x11_set_input_focus(godot_xid);
+            }
+            _ => {}
+        }
+
+        self.x11_pointer_inside = inside;
     }
 
     #[func]
@@ -923,6 +983,80 @@ impl WebView {
         if let Some(webview) = &self.webview {
             let _ = webview.zoom(scale_factor);
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn godot_window_x11_id(window_id: i32) -> Option<std::os::raw::c_ulong> {
+    use godot::classes::display_server::HandleType;
+
+    let display_server = DisplayServer::singleton();
+    let native = display_server
+        .window_get_native_handle_ex(HandleType::WINDOW_HANDLE)
+        .window_id(window_id)
+        .done();
+    if native == 0 {
+        None
+    } else {
+        Some(native as std::os::raw::c_ulong)
+    }
+}
+
+/// Returns the X11 window id of the native webview window. wry (WebKitGTK backend) realizes
+/// its internal GtkWindow on the X11 child window it created under the Godot window, so we
+/// walk webview widget -> GtkWindow -> GdkWindow and downcast it to a gdkx11::X11Window.
+#[cfg(target_os = "linux")]
+fn webview_x11_id(webview: &wry::WebView) -> Option<std::os::raw::c_ulong> {
+    use gtk::prelude::WidgetExt;
+    use wry::WebViewExtUnix;
+
+    let widget = webview.webview();
+    let toplevel = widget.toplevel()?;
+    let gdk_window = toplevel.window()?;
+    let x11_window = {
+        use gdkx11::glib::object::Cast as _;
+        gdk_window.downcast_ref::<gdkx11::X11Window>()?
+    };
+    Some(x11_window.xid() as std::os::raw::c_ulong)
+}
+
+#[cfg(target_os = "linux")]
+fn x11_input_focus_window() -> Option<std::os::raw::c_ulong> {
+    use x11_dl::xlib::{Window as XWindow, Xlib};
+
+    let xlib = Xlib::open().ok()?;
+    unsafe {
+        let display = xlib.XOpenDisplay(std::ptr::null());
+        if display.is_null() {
+            return None;
+        }
+        let mut focus: XWindow = 0;
+        let mut revert_to: std::os::raw::c_int = 0;
+        (xlib.XGetInputFocus)(display, &mut focus, &mut revert_to);
+        (xlib.XCloseDisplay)(display);
+        Some(focus as std::os::raw::c_ulong)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn x11_set_input_focus(window: std::os::raw::c_ulong) {
+    use x11_dl::xlib::{Window as XWindow, Xlib};
+
+    let xlib = Xlib::open().ok();
+    let Some(xlib) = xlib else {
+        return;
+    };
+    unsafe {
+        let display = xlib.XOpenDisplay(std::ptr::null());
+        if display.is_null() {
+            return;
+        }
+        // XSetInputFocus(display, window, revert_to, time):
+        //  - revert_to = RevertToParent (2): if the webview is unmapped/destroyed while it
+        //    owns the focus, the X server hands the focus back to its parent (Godot window).
+        //  - time = CurrentTime (0).
+        (xlib.XSetInputFocus)(display, window as XWindow, 2, 0);
+        (xlib.XCloseDisplay)(display);
     }
 }
 
