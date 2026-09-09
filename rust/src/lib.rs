@@ -1026,7 +1026,7 @@ fn x11_input_focus_window() -> Option<std::os::raw::c_ulong> {
 
     let xlib = Xlib::open().ok()?;
     unsafe {
-        let display = xlib.XOpenDisplay(std::ptr::null());
+        let display = (xlib.XOpenDisplay)(std::ptr::null());
         if display.is_null() {
             return None;
         }
@@ -1047,7 +1047,7 @@ fn x11_set_input_focus(window: std::os::raw::c_ulong) {
         return;
     };
     unsafe {
-        let display = xlib.XOpenDisplay(std::ptr::null());
+        let display = (xlib.XOpenDisplay)(std::ptr::null());
         if display.is_null() {
             return;
         }
