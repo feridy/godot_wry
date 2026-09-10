@@ -695,6 +695,19 @@ impl WebView {
             "visibility_changed",
             &Callable::from_object_method(&*self.base(), "update_visibility"),
         );
+
+        #[cfg(target_os = "linux")]
+        if self.forward_input_events {
+            // On Linux the DOM events this node forwards back into Godot are dispatched from
+            // inside its own _process() (see the GTK pump in update_webview). If the engine
+            // then delivered the re-injected event to this same node's _input virtual, gdext
+            // would try to mutably bind the Rust instance while it is already borrowed by
+            // process() -> "Gd<T>::bind_mut() failed, already bound".
+            // The node does not need _input on Linux: clicking *outside* the webview used to
+            // call focus_parent(), and that is now handled by the X11 focus steering in
+            // update_x11_keyboard_focus() (pointer leaves the rect -> focus back to Godot).
+            self.base().set_process_input(false);
+        }
     }
 
     /// Linux-only: the webview is a native X11 child window stacked over the Godot window,
