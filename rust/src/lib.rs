@@ -706,7 +706,7 @@ impl WebView {
             // The node does not need _input on Linux: clicking *outside* the webview used to
             // call focus_parent(), and that is now handled by the X11 focus steering in
             // update_x11_keyboard_focus() (pointer leaves the rect -> focus back to Godot).
-            self.base().set_process_input(false);
+            self.base().clone().set_process_input(false);
         }
     }
 
